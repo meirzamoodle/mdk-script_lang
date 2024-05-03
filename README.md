@@ -6,4 +6,8 @@
 3. Done
 
 # How to use:
+## Add new string identifier
 `mdk lang add newstringid -d "the newstringid description" lang.php`
+
+## Sort the existing string identifiers in a file
+`mdk lang sort lang.php`
