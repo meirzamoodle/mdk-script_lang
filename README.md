@@ -6,4 +6,4 @@
 3. Done
 
 # How to use:
-`mdk lang -n newstringid -d "the newstringid description" -f lang.php`
+`mdk lang add newstringid -d "the newstringid description" lang.php`
