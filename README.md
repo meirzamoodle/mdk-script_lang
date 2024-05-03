@@ -6,4 +6,4 @@ How to install:
 3. Done
 
 How to use:
-mdk lang -n newstringid -d "the newstringid description" -f lang.php
+`mdk lang -n newstringid -d "the newstringid description" -f lang.php`
