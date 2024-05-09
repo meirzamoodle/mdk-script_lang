@@ -11,3 +11,8 @@
 
 ## Sort the existing string identifiers in a file
 `mdk lang sort lang.php`
+
+## Review the modified language string on the pull branch
+To use "review" action, developer must pull a patch with testing mode `mdk pull <mdl> -t"` and then use the below command:
+
+`mdk lang review`
