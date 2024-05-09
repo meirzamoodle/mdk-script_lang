@@ -23,10 +23,13 @@ http://github.com/FMCorz/mdk
 """
 
 
-import logging
 from ..command import Command
+import logging
+import os
 import re
-
+import subprocess
+import sys
+from .. import tools
 
 class LangCommand(Command):
 
@@ -67,17 +70,18 @@ class LangCommand(Command):
                             )
                         ]
                     ),
-                    'fix': (
+                    'review': (
                         {
-                            'help': 'Fix the order without changing the old code.'
+                            'help': 'Fix the order of the new language string based on the issue being reviewed.'
                         },
                         [
                             (
-                                ['filename'],
+                                ['issue'],
                                 {
-                                    'default': '',
-                                    'metavar': 'filename',
-                                    'help': 'filename',
+                                    'default': None,
+                                    'help': 'tracker issue to review from (MDL-12345, 12345). If not specified, read from current branch.',
+                                    'metavar': 'issue',
+                                    'nargs': '?'
                                 }
                             )
                         ]
@@ -111,70 +115,73 @@ class LangCommand(Command):
         )
     ]
     _description = 'Sort lang strings alphabetically'
-
-    deprecated_strings = {}
-    sort_deprecated_strings = {}
-    non_deprecated_strings = []
-    non_sort_deprecated_strings = []
-    file_content = []
-    non_deprecated_index = {}
+    _args = None
+    _string_list = {}
+    _M = None
+    _index_being_compared = None
 
     def run(self, args):
 
         # Loading instance
-        M = self.Wp.resolve(args.name)
-        if not M:
+        self._M = self.Wp.resolve(args.name)
+        if not self._M:
             raise Exception('This is not a Moodle instance')
 
-        if not args.filename:
-            raise Exception('Please specifiy the filename path')
-        else:
-            self.filename = args.filename
+        self._args = args
+        if not args.action == 'review':
+            if not args.filename:
+                raise Exception('Please specifiy the filename path')
+            else:
+                self.filename = args.filename
 
-        # Build data from the file to ease the process.
-        self.build_data()
+            # Build data from the file to ease the process.
+            file_content = self.load_data_from_file()
+            self._string_list = self.prepare_data(file_content)
 
         if args.action == 'add':
             if not args.string:
                 raise Exception('Please specifiy the lang string.')
-            self.new_string = args.string
-            self.new_desc = args.desc if args.desc else ''
-            self.add()
+            new_string = args.string
+            new_desc = args.desc if args.desc else ''
+            index = self.add(new_string, new_desc, file_content)
+            if index is not None:
+                logging.info("✅ New lang string '%s' has been added." % (new_string))
+                logging.info('Go to line: %s:%d' % (self.filename, index))
         elif args.action == 'sort':
-            self.sort()
-        elif args.action == 'fix':
-            print('coming soon.')
-            # # Git repo
-            # repo = M.git()
+            self.sort(file_content)
+        elif args.action == 'review':
+            issuenb = args.issue
+            if not issuenb:
+                parsedbranch = tools.parseBranch(self._M.currentBranch())
+                if not parsedbranch:
+                    raise Exception('Could not extract issue number from %s' % self._M.currentBranch())
+                issuenb = parsedbranch['issue']
+            self.review()
 
-            # # Git diff
-            # cmd = 'diff -U0 | grep "^[+-]" | grep -Ev "^(--- a/|\+\+\+ b/)"'
+    def sort(self, content):
+        sort_deprecated_strings = {}
+        non_sort_deprecated_strings = []
 
-            # # Creating and checking out the new branch
-            # result = repo.execute(cmd)
-            # print(result)
-
-    def sort(self):
         # Find the index of the first occurrence of "$string["
-        index = next((i for i, line in enumerate(self.file_content) if '$string[' in line), None)
+        index = next((i for i, line in enumerate(content) if '$string[' in line), None)
 
         if index is not None:
             # Get the lines from the beginning to just before the first "$string[" line
-            header = ''.join(self.file_content[:index])
+            header = ''.join(content[:index])
 
         current_group = None
         # Build data for the non-deprecated and the deprecated strings
-        for line in self.non_deprecated_index.values():
+        for line in self._string_list.values():
             if line[0] == 'deprecated':
                 current_group = line[1]
-                self.sort_deprecated_strings[current_group] = []
+                sort_deprecated_strings[current_group] = []
             elif current_group is not None:
-                self.sort_deprecated_strings[current_group].append(line)
+                sort_deprecated_strings[current_group].append(line)
             else:
-                self.non_sort_deprecated_strings.append(line)
+                non_sort_deprecated_strings.append(line)
 
         # Generate strings according to alphabetical order for the non-deprecated.
-        sorted_non_sort_deprecated_strings = sorted(self.non_sort_deprecated_strings, key=lambda x: x[0])
+        sorted_non_sort_deprecated_strings = sorted(non_sort_deprecated_strings, key=lambda x: x[0])
         cleaned_list = [[item[0], item[1].rstrip('\n')+'\n'] for item in sorted_non_sort_deprecated_strings]
         content = ''
         for line in cleaned_list:
@@ -183,14 +190,14 @@ class LangCommand(Command):
             content += self.generate_lang_string(string, desc)
 
         # Generate strings according to alphabetical order for the deprecated.
-        for key, value in enumerate(self.sort_deprecated_strings):
-            sorted_data = sorted(self.sort_deprecated_strings[value], key=lambda x: x[0])
-            self.sort_deprecated_strings[value] = sorted_data
+        for _, value in enumerate(sort_deprecated_strings):
+            sorted_data = sorted(sort_deprecated_strings[value], key=lambda x: x[0])
+            sort_deprecated_strings[value] = sorted_data
 
         content_deprecated = ''
-        for key, value in enumerate(self.sort_deprecated_strings):
+        for _, value in enumerate(sort_deprecated_strings):
             content_deprecated += '\n'+value
-            for line in self.sort_deprecated_strings[value]:
+            for line in sort_deprecated_strings[value]:
                 string = line[0]
                 desc = line[1]
                 content_deprecated += self.generate_lang_string(string, desc.rstrip('\n')+'\n')
@@ -203,20 +210,18 @@ class LangCommand(Command):
             self.save_new_string(content)
             logging.info('Lang string sorted.')
             logging.info('Go to line: %s' % (self.filename))
-        except:
-            raise Exception('Failed to save the file')
+        except Exception as e:
+            raise Exception('Failed to save the file: %s', repr(e))
 
-    def add(self):
-        has_duplicate, has_duplicate_index = self.has_duplicate(self.new_string)
+    def add(self, new_string, new_desc, content):
+
+        # Avoid string identifier duplication.
+        has_duplicate, has_duplicate_index = self.has_duplicate(new_string)
         if has_duplicate:
-            raise Exception('The "%s" is already exist! \nGo to line: %s:%d' % (self.new_string, self.filename, has_duplicate_index))
+            raise Exception('The "%s" is already exist! \nGo to line: %s:%d' % (new_string, self.filename, has_duplicate_index))
 
         # Now only support for the actively used string.
-        non_deprecated_strings = []
-        for line in self.non_deprecated_index.values():
-            if line[0] == 'deprecated':
-                break
-            non_deprecated_strings.append(line[0])
+        non_deprecated_strings = self.remove_deprecated(self._string_list)
 
         letters = {}
         current_char = ''
@@ -231,9 +236,9 @@ class LangCommand(Command):
             letters[first_char][-1].append(string)
 
         letter_groups = {key: value for key, value in letters.items()}
-        # letter_groups_sorted = dict(sorted(letter_groups.items()))
+
         # If the new_string first character is not exist then find the nearest letter
-        first_char = self.new_string[0]
+        first_char = new_string[0]
         while first_char not in letter_groups.keys():
             first_char = self.nearest_letter_to_list(first_char, letter_groups.keys())
 
@@ -252,12 +257,12 @@ class LangCommand(Command):
 
         # Add the new string to the string list
         strings_list_sorted = letter_groups[first_char][max_idx]
-        strings_list_sorted.append(self.new_string)
+        strings_list_sorted.append(new_string)
         strings_list_sorted.sort()
 
         # Get which string is the nearest from the new string
         step = None
-        position = strings_list_sorted.index(self.new_string)
+        position = strings_list_sorted.index(new_string)
         if position == 0:
             step = 0
             target_string = strings_list_sorted[1]
@@ -267,7 +272,7 @@ class LangCommand(Command):
 
         # Get the location of the target string
         insert_index = None
-        for i, line in enumerate(self.file_content):
+        for i, line in enumerate(content):
             if line.startswith(self.generate_var_string(target_string)):
                 insert_index = i
                 break
@@ -277,11 +282,11 @@ class LangCommand(Command):
         insert_index = insert_index + step
         while not done:
             try:
-                if self.file_content[insert_index].lower().startswith('// deprecated'):
+                if content[insert_index].lower().startswith('// deprecated'):
                     insert_index = insert_index - 1
                     done = True
-                elif (self.file_content[insert_index].lower().startswith("$string['") or
-                        self.file_content[insert_index].lower().startswith('//')):
+                elif (content[insert_index].lower().startswith("$string['") or
+                        content[insert_index].lower().startswith('//')):
                     done = True
                 else:
                     insert_index = insert_index + 1
@@ -289,20 +294,16 @@ class LangCommand(Command):
                 done = True
 
         # Ensure to put the new string without new paragraph at the top
-        # while self.file_content[insert_index-1] == "\n":
-        #     insert_index = insert_index - 1
-
-        self.file_content.insert(
-            insert_index, self.generate_lang_string(self.new_string, "'%s';\n" % self.new_desc)
+        content.insert(
+            insert_index, self.generate_lang_string(new_string, "'%s';\n" % new_desc)
         )
 
         # Update the file.
         try:
-            self.save_new_string(self.file_content)
-            logging.info('New lang string has been added.')
-            logging.info('Go to line: %s:%d' % (self.filename, insert_index + 1))
-        except:
-            raise Exception('Failed to save the file')
+            self.save_new_string(content)
+            return insert_index + 1
+        except Exception as e:
+            raise Exception('Failed to save the file: %s', repr(e))
 
     def nearest_letter_to_list(self, target_letter, letter_list):
         target_letter = target_letter.lower()  # Convert to lowercase for case-insensitivity
@@ -319,38 +320,46 @@ class LangCommand(Command):
 
         return nearest_letter
 
-    def build_data(self):
+    def load_data_from_file(self, filename = None):
+        if filename is None:
+            filename = self.filename
+
+        file_content = []
+        with open(filename, "r") as file:
+            file_content = file.readlines()
+        return file_content
+
+    def prepare_data(self, content):
+        string_list = {}
         current_key = None
         current_value = []
         index = None
-        with open(self.filename, "r") as file:
-            self.file_content = file.readlines()
-            for i, line in enumerate(self.file_content):
-                if line.startswith("$string["):
-                    if current_key is not None:
-                        c_value = ''.join(current_value)
-                        self.non_deprecated_index[index] = [current_key, c_value]
-                        self.non_deprecated_strings.append(current_key) # old code
-                    key, value = re.split(r'\s*=\s*', line, maxsplit=1)
-                    current_key = key.strip('$string[').strip("']")
-                    current_value = [value]
-                    index = i
-                elif line.lower().startswith("// deprecated"):
-                    self.non_deprecated_index[i] = ['deprecated', line]
-                else:
-                    current_value.append(line)
+        for i, line in enumerate(content):
+            if line.startswith("$string["):
+                if current_key is not None:
+                    c_value = ''.join(current_value)
+                    string_list[index] = [current_key, c_value]
+                key, value = re.split(r'\s*=\s*', line, maxsplit=1)
+                current_key = key.strip('$string[').strip("']")
+                current_value = [value]
+                index = i
+            elif line.lower().startswith("// deprecated"):
+                string_list[i] = ['deprecated', line]
+            else:
+                current_value.append(line)
 
-            # Add the last key-value pair
-            if current_key is not None:
-                c_value = ''.join(current_value)
-                self.non_deprecated_index[index] = [current_key, c_value]
-                self.non_deprecated_strings.append(current_key)
+        # Add the last key-value pair
+        if current_key is not None:
+            c_value = ''.join(current_value)
+            string_list[index] = [current_key, c_value]
 
-            # Sort the keys of the dictionary
-            sorted_keys = sorted(self.non_deprecated_index.keys())
+        # Sort the keys of the dictionary
+        sorted_keys = sorted(string_list.keys())
 
-            # Create a new dictionary with sorted keys
-            self.non_deprecated_index = {key: self.non_deprecated_index[key] for key in sorted_keys}
+        # Create a new dictionary with sorted keys
+        string_list = {key: string_list[key] for key in sorted_keys}
+
+        return string_list
 
     def generate_var_string(self, string):
         return "$string['%s']" % string
@@ -360,17 +369,100 @@ class LangCommand(Command):
 
     def has_duplicate(self, string):
         new_item_index = -1
-        if string in self.non_deprecated_strings:
-            for i, line in enumerate(self.file_content):
-                if line.startswith(self.generate_var_string(string)):
-                    new_item_index = i + 1
-                    break
-            return True, new_item_index
+        for key, value in self._string_list.items():
+            stringid = value[0]
+            if string == stringid:
+                new_item_index = key + 1
+                return True, new_item_index
         return False, 0
 
-    def save_new_string(self, content):
+    def remove_deprecated(self, string_list):
+        non_deprecated_strings = []
+        for line in string_list.values():
+            if line[0] == 'deprecated':
+                break
+            non_deprecated_strings.append(line[0])
+        return non_deprecated_strings
+
+    def save_new_string(self, content, filetarget = None):
+        if filetarget is None:
+            filetarget = self.filename
+
         newfile = "".join(content)
-        f = open(self.filename, "r+")
+        f = open(filetarget, "r+")
         f.truncate(0)
         f.write(newfile)
         f.close()
+
+    def review(self):
+
+        total_lang = 0
+        total_lang_fixed = 0
+
+        # Reading the information about the current instance.
+        currentbranch = self._M.currentBranch()
+
+        cmd = "git log main@{1}.."+currentbranch+" --oneline | tail -1"
+        firstcommit = subprocess.getoutput(cmd)
+        firstcommithash = firstcommit.split()[0]
+
+        # Get files that were modified.
+        file_paths = subprocess.getoutput('git diff --name-only ' + firstcommithash + '^ HEAD')
+        file_paths_list = file_paths.split("\n")
+        filtered_files = [file for file in file_paths_list if "lang/en/" in file]
+
+        cwd = os.path.realpath(os.path.abspath(os.getcwd()))
+        for file in filtered_files:
+            proc = subprocess.getoutput("git diff -U0 " + firstcommithash + "^ HEAD " + cwd + "/" + file + " | grep '^[+]'")
+            procsplit = proc.split("\n")
+            procsplit.pop(0)
+            content = []
+            for string in procsplit:
+                content.append(string[1:] + '\n')
+            string_list = self.prepare_data(content)
+            index_being_compared = None
+            # Remove the language string.
+            for _, value in string_list.items():
+                newstring = self.generate_lang_string(value[0], value[1])
+                index_being_compared = self.replace_string_in_file(file, newstring)
+
+                # Add the language string.
+                self.filename = file
+                file_content = self.load_data_from_file(file)
+                self._string_list = self.prepare_data(file_content)
+                new_string = value[0]
+                # Remove the first character "'" and the last three characters "';\n" of the description.
+                new_desc = value[1][1:-3]
+                index_new = self.add(new_string, new_desc, file_content)
+                if index_new is not None:
+                    if index_being_compared != index_new:
+                        logging.info("✅ The lang string '%s' has been fixed." % (new_string))
+                        logging.info('Go to line: %s:%d' % (self.filename, index_new))
+                        logging.info('----------------------')
+                        total_lang_fixed += 1
+
+                total_lang += 1
+
+
+        logging.info('%d reviewed, %d fixed' % (total_lang, total_lang_fixed))
+
+
+    def replace_string_in_file(self, file_path, target_string):
+        # Open the file in read mode
+        with open(file_path, 'r') as file:
+            # Read the content of the file
+            content = file.read()
+
+        # Replace the target string with an empty string
+        modified_content = content.replace(target_string, '', 1)
+
+        # Open the file in write mode and write the modified content
+        with open(file_path, 'w') as file:
+            file.write(modified_content)
+
+        index = content.find(target_string)
+        if index != -1:
+            # Find the line number
+            line_number = content.count('\n', 0, index) + 1
+
+        return line_number
